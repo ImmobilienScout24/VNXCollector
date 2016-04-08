@@ -3,6 +3,7 @@ import scala.xml._
 import collection.mutable.ListBuffer
 import java.net._
 import java.io._
+
 import scala.io._
 import akka.actor.Actor
 import akka.actor.ActorSystem
@@ -25,7 +26,7 @@ trait Logger {
 object collector extends App with Logger  {
 
   val loggerFile = "collector-error.log"
-  
+
   if( (args.length != 0 && args.length != 2) || (args.length > 0 && args(0) != "-c") )  {
     println("Usage: collector -c config.file")
     log("Usage: collector -c config.file")
@@ -44,16 +45,16 @@ object collector extends App with Logger  {
     XML.loadFile(configFile)
   }  catch  {
     case _ : Throwable => println("Error in processing configuration file " + configFile)
-                          log("Error in processing configuration file " + configFile)
-                          sys.exit(-1)
+      log("Error in processing configuration file " + configFile)
+      sys.exit(-1)
   }
-    
+
   if( (config \ "configuration").length != 1 )  {
     println("Error: no configuration in the file " + configFile)
     log("Error: no configuration in the file " + configFile)
     sys.exit(-1)
   }
-    
+
   val configuration: Map[String,Any] = ((scala.xml.Utility.trim((config \ "configuration")(0)).child) map
     (c => c.label match {
       case "carbon" => "carbon" -> c.attributes.asAttrMap
@@ -61,7 +62,7 @@ object collector extends App with Logger  {
         (r => (r.attributes("what").toString, r.attributes("value").toString))).toList
       case _ => c.label -> c.text
     })
-  ).toMap
+    ).toMap
 
   if( !configuration.contains("carbon") )  {
     println("Wrong carbon description in the configuration file " + configFile)
@@ -70,14 +71,14 @@ object collector extends App with Logger  {
   }
 
   val interval = if( configuration.contains("interval") )
-                   configuration("interval").asInstanceOf[String].toInt
-                 else
-                   10
+    configuration("interval").asInstanceOf[String].toInt
+  else
+    10
 
   val blockCmd = if( (config \ "vnxblock" \ "cmd").length > 0 )
-                   (config \ "vnxblock" \ "cmd")(0).text
-                 else
-                   "" 
+    (config \ "vnxblock" \ "cmd")(0).text
+  else
+    ""
 
   val blockMethods: Map[String, Map[String,Any]] = (config \ "vnxblock" \ "method" map (m =>
     (m \ "name").text -> ( scala.xml.Utility.trim(m).child map ( c =>
@@ -87,23 +88,35 @@ object collector extends App with Logger  {
           ((h \ "@pos").text, (h \ "@sep").text))).toList
         case _ => c.label -> c.text
       })).toMap
-  )).toMap
- 
+    )).toMap
+
   val doBlock = !blockMethods.isEmpty && (blockCmd != "")
 
-  val fileCmd = if( (config \ "vnxfile" \ "cmd").length > 0 )
-                  (config \ "vnxfile" \ "cmd")(0).text
-                else
-                  "" 
+  val files: List[Map[String,Any]] = (config \ "vnxfile" map (v =>
+    (scala.xml.Utility.trim(v).child map (vc => vc.label match {
+      case "cmd" => "cmd" ->
+        vc.text
+      case "methods" => "methods" ->
+        (vc.child map (m => m.label match {
+          case "method" => m.attributes("name").toString -> (m.attributes("cmd").toString, m.attributes("type").toString)
+        })).toMap
+    })).toMap
+    )).toList
 
-  val fileMethods: Map[String,(String,String)] = (config \ "vnxfile" \\ "method" map
-    (m => m.attributes("name").toString -> (m.attributes("cmd").toString, m.attributes("type").toString))).toMap
+  val fileCmd: String = if( files.length > 0 && files.head.contains("cmd"))
+    files.head.getOrElse("cmd", "").toString
+  else
+    ""
+
+  val fileMethods: Map[String,(String,String)] =  files.head.getOrElse("methods", Map()).asInstanceOf[Map[String,(String,String)]]
 
   val doFile = !fileMethods.isEmpty && (fileCmd != "")
 
+
+
   val vnxList: List[Map[String,Any]] = (config \ "vnx" map (v =>
     (scala.xml.Utility.trim(v).child map (vc => vc.label match {
-      case "block" => "block" -> 
+      case "block" => "block" ->
         (vc.child map (c => c.label match {
           case "methods" => "method" -> (c.child map (c => c.attributes.asAttrMap)).toList
           case _ => c.label -> c.text
@@ -116,7 +129,7 @@ object collector extends App with Logger  {
         })).toMap
       case _ => vc.label -> vc.text
     })).toMap
-  )).toList
+    )).toList
 
   if( vnxList.length == 0 )  {
     println("At least one VNX should be described in the configuration file " + configFile)
@@ -126,13 +139,13 @@ object collector extends App with Logger  {
 
   val system = ActorSystem("vnx")
   val vnxActList = (vnxList map (v => (v, system.actorOf( Props(new VNX(v, configuration,
-                                                                        blockCmd, blockMethods,
-                                                                        fileCmd, fileMethods)),
-                                                          name = v("name").asInstanceOf[String] )
-                   ))).toList
+    blockCmd, blockMethods,
+    files)),
+    name = v("name").asInstanceOf[String] )
+    ))).toList
 
   while(true) {
-    for( v <- vnxActList )  { 
+    for( v <- vnxActList )  {
       if( v._1.contains("block") && doBlock )  v._2 ! "block"
       if( v._1.contains("file") && doFile )  v._2 ! "file"
     }
@@ -148,8 +161,7 @@ class VNX( vnx: Map[String,Any],
            configuration: Map[String,Any],
            blockCmd: String,
            blockMethods: Map[String, Map[String,Any]],
-           fileCmd: String,
-           fileMethods: Map[String,(String,String)] ) extends Actor with Logger  {
+           files: List[Map[String,Any]]) extends Actor with Logger  {
 
   val arg = "(#)([A-Za-z]+)".r
   val numbers = "[0-9]+".r
@@ -166,13 +178,13 @@ class VNX( vnx: Map[String,Any],
     case "file" => file
     case _ => log("Strange message")
   }
-   
+
 
   def block {
-    
+
     val timestamp: Long = System.currentTimeMillis / 1000
     sock = try { new Socket( carbon("address"), carbon("port").toInt ) }
-           catch { case e: Exception => null }
+    catch { case e: Exception => null }
     out = if( sock != null )  sock.getOutputStream()  else  null
     if( out == null )  {
       log(vname + " block: Can't connect to the carbon")
@@ -183,34 +195,34 @@ class VNX( vnx: Map[String,Any],
     for( m <- vb("method").asInstanceOf[List[Map[String,String]]] )  {
       if( blockMethods.contains(m("name")) )  {
         val basecmd = blockCmd.split(" ") map (c => c match {
-                        case arg(a1,a2) => vb.getOrElse(a2,m.getOrElse(a2," ")).asInstanceOf[String]
-                        case _ => c
-                      })
+          case arg(a1,a2) => vb.getOrElse(a2,m.getOrElse(a2," ")).asInstanceOf[String]
+          case _ => c
+        })
         val cmd = basecmd ++ blockMethods(m("name"))("cmd").asInstanceOf[String].split(" ")
         val stdout = ListBuffer[String]()
         val status: Int = try { (cmd.toSeq run ProcessLogger(stdout append _)).exitValue }
-                          catch {
-                            case e: Exception => log(vname + ": Error in run: " +
-                                                     cmd.mkString(" ") + "\n" + e.getMessage)
-                                                 -1
-                          }
+        catch {
+          case e: Exception => log(vname + ": Error in run: " +
+            cmd.mkString(" ") + "\n" + e.getMessage)
+            -1
+        }
         if( status == 0 )  {
           val result = stdout mkString "\n"
           blockMethods(m("name"))("type").asInstanceOf[String] match {
             case "simple" => simple(
-                               "vnx." + vname + ".block." + m("title") + ".",
-                               blockMethods(m("name"))("params").asInstanceOf[List[String]],
-                               result,
-                               timestamp
-                             )
+              "vnx." + vname + ".block." + m("title") + ".",
+              blockMethods(m("name"))("params").asInstanceOf[List[String]],
+              result,
+              timestamp
+            )
             case "flat" => flat(
-                             blockMethods(m("name"))("pattern").asInstanceOf[String],
-                             blockMethods(m("name"))("header").asInstanceOf[List[(String,String)]],
-                             "vnx." + vname + ".block." + m("title") + ".",
-                             blockMethods(m("name"))("params").asInstanceOf[List[String]],
-                             result,
-                             timestamp
-                           )
+              blockMethods(m("name"))("pattern").asInstanceOf[String],
+              blockMethods(m("name"))("header").asInstanceOf[List[(String,String)]],
+              "vnx." + vname + ".block." + m("title") + ".",
+              blockMethods(m("name"))("params").asInstanceOf[List[String]],
+              result,
+              timestamp
+            )
           }
         }   else  {
           log(vname + ": Error in run: " + cmd.mkString(" ") + "\n" + stdout)
@@ -224,10 +236,10 @@ class VNX( vnx: Map[String,Any],
 
 
   def file {
-    
+
     val timestamp: Long = System.currentTimeMillis / 1000
     sock = try { new Socket( carbon("address"), carbon("port").toInt ) }
-           catch { case e: Exception => null }
+    catch { case e: Exception => null }
     out = if( sock != null )  sock.getOutputStream()  else  null
     if( out == null )  {
       log(vname + " file: Can't connect to the carbon")
@@ -235,47 +247,53 @@ class VNX( vnx: Map[String,Any],
     }
 
     val vf = vnx("file").asInstanceOf[Map[String,Any]]
-    for( server <- vf("server").asInstanceOf[List[String]] )  
+    for( server <- vf("server").asInstanceOf[List[String]] )
       for( m <- vf("method").asInstanceOf[List[String]] )  {
-        if( fileMethods.contains(m) )  {
-          val basecmd = fileCmd.split(" ") map (c => c match {
-                          case arg(a1,a2) => a2 match {
-                                               case "server" => server
-                                               case "cmd" => fileMethods(m)._1
-                                               case _ => vf.getOrElse(a2," ").asInstanceOf[String] }
-                          case _ => c
-                        })
-          val cmd = basecmd.mkString(" ")
-          val cs = vf("cs").asInstanceOf[String]
-          val username = vf("username").asInstanceOf[String]
-          val password = vf("password").asInstanceOf[String]
-          val result = SSH.once(cs,username,password)(_.execute(cmd)).split("\n")
-          if( result.length > 1 )  {
-            val header = fileMethods(m)._2 match {
-                           case "composite" => result(0).split(",") map (h => replaceByList(h,repl).replace("\"","")
-                                                 .replaceFirst(" ","."))
-                           case "composite2" => result(0).split(",") map (h => replaceByList(h,repl).replace("\"","")
-                                                 .replaceFirst(" ",".").replaceFirst(" ","."))
-                           case "composite3" => result(0).split(",") map (h => replaceByList(h,repl).replace("\"","")
-                                                 .replaceFirst(" ",".").replaceFirst(" ",".").replaceFirst(" ","."))
-                           case _ => result(0).split(",") map (h => replaceByList(h,repl).replace("\"",""))
-                         }
-            val values = result(result.length-1).split(",") map (h => replaceByList(h,repl).replace("\"",""))
-            for( i <- 1 until values.length if values(i) != "" )  {
-              val msg = "vnx." + vname + ".file." + server + "." + m + "." +
-                        header(i).replace(" ","") + " " + values(i) + " " + timestamp + "\r\n"
-              try {
-                out.write(msg.getBytes)
-                out.flush
-              }  catch  {
-                case e: Exception => log(vname + ": Error in output to carbon")
+
+        for( f <- files) {
+          val fileMethods: Map[String,(String,String)] = f.getOrElse("methods", Map()).asInstanceOf[Map[String,(String,String)]]
+          val fileCmd: String = f.getOrElse("cmd", "").asInstanceOf[String]
+          if (fileMethods.contains(m)) {
+            val basecmd = fileCmd.split(" ") map (c => c match {
+              case arg(a1, a2) => a2 match {
+                case "server" => server
+                case "cmd" => fileMethods(m)._1
+                case _ => vf.getOrElse(a2, " ").asInstanceOf[String]
               }
+              case _ => c
+            })
+            val cmd = basecmd.mkString(" ")
+            val cs = vf("cs").asInstanceOf[String]
+            val username = vf("username").asInstanceOf[String]
+            val password = vf("password").asInstanceOf[String]
+            val result = SSH.once(cs, username, password)(_.execute(cmd)).split("\n")
+            if (result.length > 1) {
+              val header = fileMethods(m)._2 match {
+                case "composite" => result(0).split(",") map (h => replaceByList(h, repl).replace("\"", "")
+                  .replaceFirst(" ", "."))
+                case "composite2" => result(0).split(",") map (h => replaceByList(h, repl).replace("\"", "")
+                  .replaceFirst(" ", ".").replaceFirst(" ", "."))
+                case "composite3" => result(0).split(",") map (h => replaceByList(h, repl).replace("\"", "")
+                  .replaceFirst(" ", ".").replaceFirst(" ", ".").replaceFirst(" ", "."))
+                case _ => result(0).split(",") map (h => replaceByList(h, repl).replace("\"", ""))
+              }
+              val values = result(result.length - 1).split(",") map (h => replaceByList(h, repl).replace("\"", ""))
+              for (i <- 1 until values.length if values(i) != "") {
+                val msg = "vnx." + vname + ".file." + server + "." + m + "." +
+                  header(i).replace(" ", "") + " " + values(i) + " " + timestamp + "\r\n"
+                try {
+                  out.write(msg.getBytes)
+                  out.flush
+                } catch {
+                  case e: Exception => log(vname + ": Error in output to carbon")
+                }
+              }
+            } else {
+              log(vname + ": Incorrect answer for file method " + m + " for server " + server)
             }
-          }   else  {
-            log(vname + ": Incorrect answer for file method " + m + " for server " + server)
+          } else {
+            log(vname + ": No method " + m + " described in the configuration file")
           }
-        }   else  {
-          log(vname + ": No method " + m + " described in the configuration file" )
         }
       }
     if( sock != null )  sock.close
@@ -299,8 +317,8 @@ class VNX( vnx: Map[String,Any],
 
     values.foreach( c => for( p <- params if(p.r.findFirstIn(c) != None) )  {
       val msg = title + replaceByList(p,repl).replace(" ","") + " " + numbers.findFirstIn(c).mkString +
-                  " " + timestamp + "\r\n"
-      try { 
+        " " + timestamp + "\r\n"
+      try {
         out.write(msg.getBytes)
         out.flush
       }  catch  {
@@ -322,18 +340,18 @@ class VNX( vnx: Map[String,Any],
     val values = result.split("\n")
 
     for(i <- 0 until values.length if pm.findFirstIn(values(i)) != None &&
-                                      i + header.length < values.length)  {
+      i + header.length < values.length)  {
       val head = (values.slice(i,i+header.length).toList zip header map (h =>
-                   h._2._1 match {
-                             case "right" => (h._1.split(h._2._2))(1)
-                             case "left" => (h._1.split(h._2._2))(0)
-                             case _ => h._1
-                 })).mkString
-      values.drop(i + header.length).takeWhile(pm.findFirstIn(_) == None).foreach( c => 
+        h._2._1 match {
+          case "right" => (h._1.split(h._2._2))(1)
+          case "left" => (h._1.split(h._2._2))(0)
+          case _ => h._1
+        })).mkString
+      values.drop(i + header.length).takeWhile(pm.findFirstIn(_) == None).foreach( c =>
         for( p <- params if(p.r.findFirstIn(c) != None) )  {
           val msg = title + replaceByList(head,repl).replace(" ","") + "." +
-                      replaceByList(p,repl).replace(" ","") + " " +
-                      numbers.findFirstIn(c).mkString + " " + timestamp + "\r\n"
+            replaceByList(p,repl).replace(" ","") + " " +
+            numbers.findFirstIn(c).mkString + " " + timestamp + "\r\n"
           try {
             out.write(msg.getBytes)
             out.flush
